@@ -1,0 +1,48 @@
+# Fly.io configuration
+# E-Commerce Return & Refund Lab
+
+app = "qa-lab-ecom-return-refund"
+primary_region = "ams"  # Amsterdam (closest to CIS)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+# Environment variables (non-sensitive)
+[env]
+  MISSION_ID = "ecom-return-refund"
+  DEBUG_MODE = "false"
+  ENV = "prod"
+  PLATFORM_SECRET = "platform-secret-key"
+  FLAGS_SEED = "production_seed_2026"
+
+# Machine configuration
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
+
+# Processes
+[processes]
+  app = "uvicorn app.main:app --host 0.0.0.0 --port 8080"
+
+# Health checks
+[[services.http_checks]]
+  interval = 10000
+  grace_period = "5s"
+  method = "get"
+  path = "/health"
+  protocol = "http"
+  timeout = 2000
+  tls_skip_verify = false

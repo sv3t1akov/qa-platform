@@ -1,0 +1,53 @@
+version: '3.8'
+
+# QA Training Platform - Local Development
+# Бэкенд + Лаба E-Commerce
+
+services:
+  # =============================================================================
+  # Backend API - Платформа
+  # =============================================================================
+  backend:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - FRONTEND_URL=http://localhost:3000
+      - ECOM_LAB_URL=http://lab:8080
+      - PLATFORM_SECRET=dev-secret
+      - DEBUG=true
+    depends_on:
+      lab:
+        condition: service_healthy
+    networks:
+      - qa-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # Lab - E-Commerce Return & Refund
+  # =============================================================================
+  lab:
+    build: ./labs/ecommerce_return_refund_lab
+    ports:
+      - "8081:8080"
+    environment:
+      - SESSION_ID=local-dev
+      - USER_ID=dev-user
+      - MISSION_ID=ecom-return-refund
+      - FLAGS_SEED=dev_seed_12345
+      - DEBUG_MODE=true
+      - PLATFORM_SECRET=dev-secret
+      - PORT=8080
+    networks:
+      - qa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  qa-network:
+    driver: bridge

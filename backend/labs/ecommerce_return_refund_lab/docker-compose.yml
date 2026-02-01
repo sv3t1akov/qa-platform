@@ -1,0 +1,50 @@
+# Docker Compose for local development
+# E-Commerce Return & Refund Lab
+
+version: '3.8'
+
+services:
+  # Main lab application
+  ecom-return-lab:
+    build: .
+    container_name: qa-lab-ecom-return
+    ports:
+      - "8080:8080"
+    environment:
+      - SESSION_ID=local-dev
+      - USER_ID=dev-user
+      - MISSION_ID=ecom-return-refund
+      - FLAGS_SEED=local_dev_seed_12345
+      - DEBUG_MODE=true
+      - ENV=dev
+      - PLATFORM_SECRET=dev-secret
+    volumes:
+      # Mount app directory for hot reload
+      - ./app:/app/app:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional: Redis for session management (if needed in future)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: qa-lab-redis
+  #   ports:
+  #     - "6379:6379"
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+networks:
+  default:
+    name: qa-lab-network
+
+# Named volumes (if needed)
+# volumes:
+#   redis_data:
