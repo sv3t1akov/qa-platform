@@ -50,15 +50,16 @@ deploy_app() {
     cd - > /dev/null
 }
 
-# Меню
+# Меню (рекомендуемый порядок: Lab → Backend → Frontend)
 echo ""
 echo "Что деплоить?"
 echo "1) Только E-Commerce лабу"
 echo "2) Только Backend"
-echo "3) Всё (лаба + backend)"
-echo "4) Выход"
+echo "3) Только Frontend"
+echo "4) Всё (лаба + backend + frontend)"
+echo "5) Выход"
 echo ""
-read -p "Выберите опцию (1-4): " choice
+read -p "Выберите опцию (1-5): " choice
 
 case $choice in
     1)
@@ -68,10 +69,14 @@ case $choice in
         deploy_app "Backend API" "$SCRIPT_DIR"
         ;;
     3)
-        deploy_app "E-Commerce Lab" "$SCRIPT_DIR/labs/ecommerce_return_refund_lab"
-        deploy_app "Backend API" "$SCRIPT_DIR"
+        deploy_app "Frontend" "$SCRIPT_DIR/../frontend"
         ;;
     4)
+        deploy_app "E-Commerce Lab" "$SCRIPT_DIR/labs/ecommerce_return_refund_lab"
+        deploy_app "Backend API" "$SCRIPT_DIR"
+        deploy_app "Frontend" "$SCRIPT_DIR/../frontend"
+        ;;
+    5)
         echo "Выход."
         exit 0
         ;;
@@ -87,6 +92,7 @@ echo -e "${GREEN}🎉 Деплой завершён!${NC}"
 echo -e "${GREEN}==========================================${NC}"
 echo ""
 echo "URLs:"
-echo -e "  Backend: ${YELLOW}https://qa-platform-backend.fly.dev${NC}"
-echo -e "  Lab:     ${YELLOW}https://qa-lab-ecom-return-refund.fly.dev${NC}"
+echo -e "  Frontend: ${YELLOW}https://qa-platform-frontend.fly.dev${NC}"
+echo -e "  Backend:  ${YELLOW}https://qa-platform-backend.fly.dev${NC}"
+echo -e "  Lab:      ${YELLOW}https://qa-lab-ecom-return-refund.fly.dev${NC}"
 echo ""

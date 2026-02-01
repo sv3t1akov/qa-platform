@@ -3,6 +3,12 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# Build-time env for Vite (baked into client bundle)
+ARG VITE_API_URL=
+ARG VITE_DEMO_MODE=true
+ENV VITE_API_URL=$VITE_API_URL
+ENV VITE_DEMO_MODE=$VITE_DEMO_MODE
+
 # Copy package files
 COPY package*.json ./
 

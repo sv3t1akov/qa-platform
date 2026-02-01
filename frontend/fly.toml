@@ -1,15 +1,16 @@
 # Fly.io configuration for QA Training Platform Frontend
-app = "qa-training-platform"
+# App name must match FRONTEND_URL in backend (https://qa-platform-frontend.fly.dev)
+app = "qa-platform-frontend"
 primary_region = "ams"
 
 [build]
   dockerfile = "Dockerfile"
+  [build.args]
+    VITE_API_URL = "https://qa-platform-backend.fly.dev"
+    VITE_DEMO_MODE = "false"
 
 [env]
   NODE_ENV = "production"
-  # Set your backend API URL here
-  # VITE_API_URL = "https://qa-platform-backend.fly.dev"
-  VITE_DEMO_MODE = "true"
 
 [http_service]
   internal_port = 8080

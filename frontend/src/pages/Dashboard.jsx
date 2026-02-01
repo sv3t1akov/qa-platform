@@ -14,6 +14,7 @@ import {
   Flag
 } from 'lucide-react';
 import clsx from 'clsx';
+import { api, isDemoMode } from '../services/api';
 import { domains, missionsByDomain, mockUserStats, mockFoundFlags } from '../mocks/data';
 
 // Get all missions from all domains flattened
@@ -202,15 +203,46 @@ function RecentActivity({ flags }) {
 export default function Dashboard() {
   const [missions, setMissions] = useState([]);
   const [stats, setStats] = useState(mockUserStats);
+  const [recentFlags, setRecentFlags] = useState(mockFoundFlags);
   const [filter, setFilter] = useState('all');
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Simulate loading
-    setTimeout(() => {
+    let cancelled = false;
+    if (isDemoMode) {
+      setTimeout(() => {
+        if (!cancelled) {
+          setMissions(getAllMissions());
+          setLoading(false);
+        }
+      }, 300);
+      return () => { cancelled = true; };
+    }
+    async function load() {
       setMissions(getAllMissions());
-      setLoading(false);
-    }, 300);
+      const [statsRes, flagsRes] = await Promise.all([api.getUserStats(), api.getUserFlags()]);
+      if (!cancelled && statsRes) {
+        setStats({
+          totalPoints: statsRes.totalPoints ?? 0,
+          rank: statsRes.rank ?? 'Newbie',
+          completedMissions: statsRes.completedMissions ?? 0,
+          foundBugs: statsRes.foundBugs ?? 0,
+          totalBugs: statsRes.totalBugs ?? 0,
+        });
+      }
+      if (!cancelled && Array.isArray(flagsRes)) {
+        setRecentFlags(flagsRes.map((f) => ({
+          id: f.id,
+          bugTitle: f.bugTitle,
+          missionTitle: f.missionId,
+          points: f.points,
+          foundAt: f.foundAt,
+        })));
+      }
+      if (!cancelled) setLoading(false);
+    }
+    load();
+    return () => { cancelled = true; };
   }, []);
 
   const filteredMissions = missions.filter(m => {
@@ -334,7 +366,7 @@ export default function Dashboard() {
           </div>
 
           {/* Recent Activity */}
-          <RecentActivity flags={mockFoundFlags} />
+          <RecentActivity flags={recentFlags} />
         </div>
       </div>
     </div>

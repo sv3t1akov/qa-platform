@@ -16,6 +16,7 @@ import {
   Target
 } from 'lucide-react';
 import clsx from 'clsx';
+import { api, isDemoMode } from '../services/api';
 import { domains, missionsByDomain, getTierProgress, isTierUnlocked } from '../mocks/data';
 
 // Domain Card Component
@@ -207,18 +208,30 @@ function MissionListItem({ mission, tierUnlocked, onClick }) {
 // Mission Detail View Component
 function MissionDetail({ mission, domain, onBack }) {
   const [labStarted, setLabStarted] = useState(false);
+  const [labSession, setLabSession] = useState(null);
   const [copied, setCopied] = useState(false);
-  
-  const fullEndpoint = `${mission.baseUrl}${mission.endpoint}`;
-  
+
+  const baseUrl = labSession?.baseUrl ?? mission.baseUrl;
+  const fullEndpoint = `${baseUrl}${mission.endpoint}`;
+
   const copyEndpoint = () => {
     navigator.clipboard.writeText(fullEndpoint);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleStartLab = () => {
-    setLabStarted(true);
+  const handleStartLab = async () => {
+    if (isDemoMode) {
+      setLabStarted(true);
+      return;
+    }
+    const res = await api.startLab(mission.id);
+    if (res.ok && res.data) {
+      setLabSession(res.data);
+      setLabStarted(true);
+    } else {
+      setLabStarted(true);
+    }
   };
 
   return (
@@ -356,7 +369,7 @@ function MissionDetail({ mission, domain, onBack }) {
                 <label className="text-xs text-pm-text-dim uppercase tracking-wide">Base URL</label>
                 <div className="mt-1 p-3 bg-pm-bg rounded-lg">
                   <code className="text-sm text-pm-green font-mono break-all">
-                    {mission.baseUrl}
+                    {baseUrl}
                   </code>
                 </div>
               </div>

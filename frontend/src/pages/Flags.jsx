@@ -15,6 +15,7 @@ import {
   Sparkles
 } from 'lucide-react';
 import clsx from 'clsx';
+import { api, isDemoMode } from '../services/api';
 import { mockFoundFlags, mockUserStats, domains, verifyFlag } from '../mocks/data';
 
 // ============= VERIFICATION RESULT =============
@@ -152,6 +153,20 @@ function FlagCard({ flag }) {
   );
 }
 
+// Map API flag to display shape (missionTitle from missionId if needed)
+function mapFlag(f) {
+  return {
+    id: f.id,
+    missionId: f.missionId,
+    missionTitle: f.missionId,
+    domain: f.missionId?.split('-')[0] ?? 'ecommerce',
+    bugTitle: f.bugTitle,
+    flag: f.flag,
+    points: f.points,
+    foundAt: f.foundAt,
+  };
+}
+
 // ============= MAIN FLAGS PAGE =============
 export default function Flags() {
   const [flagInput, setFlagInput] = useState('');
@@ -161,44 +176,76 @@ export default function Flags() {
   const [stats, setStats] = useState(mockUserStats);
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(!isDemoMode);
+
+  // Load flags and stats from API when not in demo mode
+  const loadFromApi = async () => {
+    const [flagsRes, statsRes] = await Promise.all([api.getUserFlags(), api.getUserStats()]);
+    if (Array.isArray(flagsRes)) setUserFlags(flagsRes.map(mapFlag));
+    if (statsRes) {
+      setStats({
+        totalPoints: statsRes.totalPoints ?? 0,
+        rank: statsRes.rank ?? 'Newbie',
+        completedMissions: statsRes.completedMissions ?? 0,
+        foundBugs: statsRes.foundBugs ?? 0,
+        totalBugs: statsRes.totalBugs ?? 0,
+        foundFlags: statsRes.foundBugs ?? 0,
+        totalFlags: statsRes.totalBugs ?? 0,
+      });
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    if (isDemoMode) {
+      setLoading(false);
+      return;
+    }
+    loadFromApi();
+  }, []);
 
   // Handle flag verification
   const handleVerifyFlag = async () => {
     if (!flagInput.trim() || verifying) return;
-    
+
     setVerifying(true);
     setVerificationResult(null);
-    
-    // Simulate API delay
-    await new Promise(r => setTimeout(r, 800));
-    
-    const result = verifyFlag(flagInput.trim());
-    setVerificationResult(result);
-    
-    // If valid new flag, add to list and update stats
-    if (result.valid && result.isNew) {
-      const newFlag = {
-        id: `flag-${Date.now()}`,
-        missionId: 'demo',
-        missionTitle: result.mission || 'Demo Mission',
-        domain: 'fintech',
-        bugId: 'demo',
-        bugTitle: result.bug || 'Demo Bug',
-        flag: flagInput.trim(),
-        points: result.points,
-        foundAt: new Date().toISOString(),
-        verified: true,
-      };
-      
-      setUserFlags(prev => [newFlag, ...prev]);
-      setStats(prev => ({
-        ...prev,
-        totalPoints: prev.totalPoints + result.points,
-        foundFlags: prev.foundFlags + 1,
-      }));
-      setFlagInput('');
+
+    if (isDemoMode) {
+      await new Promise((r) => setTimeout(r, 800));
+      const result = verifyFlag(flagInput.trim());
+      setVerificationResult(result);
+      if (result.valid && result.isNew) {
+        const newFlag = {
+          id: `flag-${Date.now()}`,
+          missionId: 'demo',
+          missionTitle: result.mission || 'Demo Mission',
+          domain: 'fintech',
+          bugId: 'demo',
+          bugTitle: result.bug || 'Demo Bug',
+          flag: flagInput.trim(),
+          points: result.points,
+          foundAt: new Date().toISOString(),
+          verified: true,
+        };
+        setUserFlags((prev) => [newFlag, ...prev]);
+        setStats((prev) => ({
+          ...prev,
+          totalPoints: prev.totalPoints + result.points,
+          foundFlags: (prev.foundFlags ?? prev.foundBugs ?? 0) + 1,
+        }));
+        setFlagInput('');
+      }
+      setVerifying(false);
+      return;
     }
-    
+
+    const result = await api.verifyFlag(flagInput.trim());
+    setVerificationResult(result);
+    if (result.valid && result.isNew) {
+      setFlagInput('');
+      await loadFromApi();
+    }
     setVerifying(false);
   };
 
@@ -325,7 +372,7 @@ export default function Flags() {
             <div>
               <p className="text-sm text-pm-text-muted">Общий прогресс</p>
               <p className="text-2xl font-bold text-pm-text">
-                {stats.foundFlags}/{stats.totalFlags}
+                {stats.foundFlags ?? stats.foundBugs ?? 0}/{stats.totalFlags ?? stats.totalBugs ?? 0}
               </p>
             </div>
           </div>
