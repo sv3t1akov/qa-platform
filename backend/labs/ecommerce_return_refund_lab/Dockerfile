@@ -12,6 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app/ ./app/
+# Copy products catalog for T1 mission (GET /api/v1/products/{id})
+COPY products_1_1000.txt ./
 
 # Create non-root user for security
 RUN useradd -m -u 1000 labuser && chown -R labuser:labuser /app

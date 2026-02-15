@@ -1,32 +1,101 @@
-import { useState } from 'react';
-import { Link, useLocation } from 'react-router-dom';
-import { 
-  LayoutDashboard, 
-  FlaskConical, 
-  Flag, 
-  Settings, 
+import { useState, useEffect } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import {
+  LayoutDashboard,
+  FlaskConical,
+  BookOpen,
+  Settings,
   ChevronLeft,
   ChevronRight,
   Bug,
   Zap,
   Trophy,
   HelpCircle,
-  User
+  User,
+  LogOut
 } from 'lucide-react';
 import clsx from 'clsx';
 import { mockUserStats } from '../mocks/data';
+import api from '../services/api';
+import { authService } from '../services/auth';
+import { isDemoMode } from '../services/api';
 
 const navItems = [
   { path: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { path: '/lab', icon: FlaskConical, label: 'API Lab' },
-  { path: '/flags', icon: Flag, label: 'Flags' },
+  { path: '/theory', icon: BookOpen, label: 'Теория' },
 ];
 
 export default function Layout({ children }) {
   const [collapsed, setCollapsed] = useState(false);
   const location = useLocation();
-  const isDemoMode = !import.meta.env.VITE_API_URL;
-  const stats = mockUserStats;
+  const navigate = useNavigate();
+  const [stats, setStats] = useState(mockUserStats);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (isDemoMode) {
+      setLoading(false);
+      return;
+    }
+
+    async function loadUserData() {
+      try {
+        const [userRes, statsRes] = await Promise.all([
+          api.getCurrentUser(),
+          api.getUserStats(),
+        ]);
+
+        if (userRes.ok && userRes.data) {
+          setCurrentUser(userRes.data);
+        }
+
+        if (statsRes) {
+          // Обработка новой структуры ранга (объект) или старой (строка)
+          let rankData = statsRes.rank;
+          if (typeof rankData === 'string') {
+            // Старый формат - преобразуем в новый
+            rankData = {
+              id: rankData.toLowerCase().replace(/\s+/g, '_'),
+              nameRu: rankData,
+              nameEn: rankData,
+              color: '#9CA3AF'
+            };
+          }
+          
+          setStats({
+            totalPoints: statsRes.totalPoints ?? 0,
+            rank: rankData,
+            completedMissions: statsRes.completedMissions ?? 0,
+            foundBugs: statsRes.foundBugs ?? 0,
+            totalBugs: statsRes.totalBugs ?? 0,
+          });
+        }
+      } catch (error) {
+        console.error('Error loading user data:', error);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadUserData();
+  }, []);
+
+  const handleLogout = async () => {
+    await api.logout();
+    navigate('/login');
+  };
+
+  const getUserInitials = () => {
+    if (currentUser?.display_name) {
+      return currentUser.display_name.substring(0, 2).toUpperCase();
+    }
+    if (currentUser?.email) {
+      return currentUser.email.substring(0, 2).toUpperCase();
+    }
+    return 'QA';
+  };
 
   return (
     <div className="flex h-screen bg-pm-bg">
@@ -88,6 +157,36 @@ export default function Layout({ children }) {
           </div>
         )}
 
+        {/* User Info */}
+        {!isDemoMode && !collapsed && currentUser && (
+          <div className="mx-3 mb-3 px-3 py-2 bg-pm-bg-card rounded-lg border border-pm-border">
+            <div className="flex items-center gap-2 mb-2">
+              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-pm-blue to-pm-purple flex items-center justify-center text-white text-xs font-medium">
+                {currentUser.avatar_url ? (
+                  <img src={currentUser.avatar_url} alt="" className="w-full h-full rounded-full" />
+                ) : (
+                  getUserInitials()
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-pm-text truncate">
+                  {currentUser.display_name || currentUser.email.split('@')[0]}
+                </p>
+                <p className="text-xs text-pm-text-muted truncate">
+                  {currentUser.email}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="w-full flex items-center gap-2 px-2 py-1.5 text-sm text-pm-text-muted hover:text-pm-text hover:bg-pm-bg-hover rounded transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+              Выйти
+            </button>
+          </div>
+        )}
+
         {/* Stats Summary */}
         {!collapsed && (
           <div className="mx-3 mb-3 p-3 bg-pm-bg-card rounded-lg">
@@ -97,7 +196,9 @@ export default function Layout({ children }) {
             </div>
             <div className="flex items-center gap-2">
               <Trophy className="w-4 h-4 text-pm-yellow" />
-              <span className="text-sm text-pm-text-muted">{stats.rank}</span>
+              <span className="text-sm text-pm-text-muted">
+                {typeof stats.rank === 'string' ? stats.rank : (stats.rank?.nameRu || 'Новичок')}
+              </span>
             </div>
           </div>
         )}
@@ -137,9 +238,26 @@ export default function Layout({ children }) {
             </button>
             
             {/* User Avatar */}
-            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-pm-blue to-pm-purple flex items-center justify-center text-white text-sm font-medium">
-              QA
-            </div>
+            {currentUser ? (
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-pm-blue to-pm-purple flex items-center justify-center text-white text-xs font-medium">
+                  {currentUser.avatar_url ? (
+                    <img src={currentUser.avatar_url} alt="" className="w-full h-full rounded-full" />
+                  ) : (
+                    getUserInitials()
+                  )}
+                </div>
+                {!collapsed && (
+                  <span className="text-sm text-pm-text-muted hidden md:block">
+                    {currentUser.display_name || currentUser.email.split('@')[0]}
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-pm-blue to-pm-purple flex items-center justify-center text-white text-sm font-medium">
+                QA
+              </div>
+            )}
           </div>
         </header>
 

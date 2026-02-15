@@ -1,33 +1,37 @@
-# Fly.io configuration for QA Training Platform Frontend
-# App name must match FRONTEND_URL in backend (https://qa-platform-frontend.fly.dev)
-app = "qa-platform-frontend"
-primary_region = "ams"
+# fly.toml app configuration file generated for qa-platform-frontend on 2026-02-01T15:49:34+05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'qa-platform-frontend'
+primary_region = 'ams'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
+
   [build.args]
-    VITE_API_URL = "https://qa-platform-backend.fly.dev"
-    VITE_DEMO_MODE = "false"
+    VITE_API_URL = 'https://qa-platform-backend.fly.dev'
+    VITE_DEMO_MODE = 'false'
 
 [env]
-  NODE_ENV = "production"
+  NODE_ENV = 'production'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
-  processes = ["app"]
+  processes = ['app']
 
-[[http_service.checks]]
-  grace_period = "10s"
-  interval = "30s"
-  method = "GET"
-  timeout = "5s"
-  path = "/health"
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256

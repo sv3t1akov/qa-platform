@@ -1,32 +1,41 @@
-# Fly.io configuration for QA Platform Backend
-app = "qa-platform-backend"
-primary_region = "ams"
+# fly.toml app configuration file generated for qa-platform-backend on 2026-02-01T15:48:07+05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'qa-platform-backend'
+primary_region = 'ams'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  FRONTEND_URL = "https://qa-platform-frontend.fly.dev"
-  ECOM_LAB_URL = "https://qa-lab-ecom-return-refund.fly.dev"
-  PLATFORM_SECRET = "platform-secret-key"
-  DEBUG = "false"
+  DEBUG = 'false'
+  ECOM_LAB_URL = 'https://qa-lab-ecom-return-refund.fly.dev'
+  FRONTEND_URL = 'https://qa-platform-frontend.fly.dev'
+  PLATFORM_SECRET = 'platform-secret-key'
+  ARGON2_MEMORY_COST = '8192'  # 8 MB — снижает риск OOM при login на VM 256 MB
+
+# Миграции выполняются при каждом деплое (до запуска приложения)
+[deploy]
+  release_command = "python -m app.db.migrate"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 0
-  processes = ["app"]
+  min_machines_running = 1  # Держать 1 машину активной — избегает 502 при cold start на login
+  processes = ['app']
 
-[[http_service.checks]]
-  grace_period = "10s"
-  interval = "30s"
-  method = "GET"
-  timeout = "5s"
-  path = "/health"
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256

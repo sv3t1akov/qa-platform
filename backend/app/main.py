@@ -11,10 +11,29 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from enum import Enum
 
-from fastapi import FastAPI, HTTPException, Body, Query, Header
+from fastapi import FastAPI, HTTPException, Body, Query, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
+import json
+import time
+from app.middleware.rate_limit import RateLimitMiddleware
+
+from app.theory_blocks import get_theory
+from app.api import auth, users, flags, ranks
+from app.config import settings as app_settings
+from app.db.session import get_db
+from app.dependencies import get_current_user
+from app.models.user import User
+from app.schemas.missions import (
+    MissionStatus, Difficulty, FlagDifficulty,
+    Theory, Domain, Mission, TierInfo, DomainMissionsResponse,
+    LabSession, FlagVerifyRequest, FlagVerifyResponse,
+    FoundFlag, UserStats, LabStartRequest
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -51,134 +70,159 @@ app = FastAPI(
 )
 
 # CORS для фронтенда
+# #region agent log
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info(f"CORS config: frontendUrl={app_settings.FRONTEND_URL}")
+# #endregion
+# CORS configuration - нельзя использовать "*" с allow_credentials=True
+cors_origins = [
+    app_settings.FRONTEND_URL,
+    "http://localhost:3000",
+    "http://localhost:5173",
+]
+# #region agent log
+logger.info(f"CORS origins configured: {cors_origins}")
+# #endregion
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.FRONTEND_URL,
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "*"  # Для MVP разрешаем все
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Rate limiting middleware для защиты от брутфорса
+app.add_middleware(RateLimitMiddleware)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENUMS & MODELS
-# ═══════════════════════════════════════════════════════════════════════════════
+# Exception handler для установки CORS заголовков при ошибках
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # #region agent log
+    logger.exception(f"Global exception handler: {request.method} {request.url.path}: {type(exc).__name__}: {exc}")
+    # #endregion
+    origin = request.headers.get('origin', '')
+    # Проверяем, что origin в списке разрешенных
+    allowed_origins = [
+        app_settings.FRONTEND_URL,
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ]
+    
+    headers = {}
+    if origin in allowed_origins:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Access-Control-Allow-Methods"] = "*"
+        headers["Access-Control-Allow-Headers"] = "*"
+    
+    # #region agent log
+    logger.info(f"Exception handler: Setting CORS headers: {headers}")
+    # #endregion
+    
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=headers
+        )
+    else:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"},
+            headers=headers
+        )
 
-class MissionStatus(str, Enum):
-    AVAILABLE = "available"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    LOCKED = "locked"
+# Middleware для логирования запросов и проверки CORS
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # #region agent log
+    origin = request.headers.get('origin', 'N/A')
+    access_control_request_method = request.headers.get('access-control-request-method', 'N/A')
+    access_control_request_headers = request.headers.get('access-control-request-headers', 'N/A')
+    logger.info(f"Incoming request: {request.method} {request.url.path}, origin={origin}, acrm={access_control_request_method}, acrh={access_control_request_headers}")
+    
+    # Проверяем, что origin в списке разрешенных
+    allowed_origins = [
+        app_settings.FRONTEND_URL,
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ]
+    logger.info(f"CORS check: origin={origin}, in_allowed={origin in allowed_origins}, allowed_origins={allowed_origins}")
+    # #endregion
+    try:
+        response = await call_next(request)
+        # #region agent log
+        acao = response.headers.get('access-control-allow-origin', 'NOT SET')
+        acam = response.headers.get('access-control-allow-methods', 'NOT SET')
+        acac = response.headers.get('access-control-allow-credentials', 'NOT SET')
+        logger.info(f"Request processed: {request.method} {request.url.path} -> {response.status_code}, acao={acao}, acam={acam}, acac={acac}")
+        
+        # Если CORS заголовки не установлены и это не health check, добавляем их вручную
+        if acao == 'NOT SET' and request.url.path != '/health' and origin != 'N/A':
+            if origin in allowed_origins:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Access-Control-Allow-Methods"] = "*"
+                response.headers["Access-Control-Allow-Headers"] = "*"
+                logger.info(f"Manually added CORS headers for origin={origin}")
+        # #endregion
+        return response
+    except Exception as e:
+        # #region agent log
+        logger.exception(f"Request error: {request.method} {request.url.path}: {type(e).__name__}: {e}")
+        # #endregion
+        # Пробрасываем исключение дальше - оно будет обработано exception_handler
+        raise
 
+# Подключение роутеров
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
+app.include_router(flags.router, prefix="/api/v1/flags", tags=["flags"])
+app.include_router(ranks.router, prefix="/api/v1/ranks", tags=["ranks"])
 
-class Difficulty(str, Enum):
-    BEGINNER = "Beginner"
-    INTERMEDIATE = "Intermediate"
-    ADVANCED = "Advanced"
-
-
-class FlagDifficulty(str, Enum):
-    EASY = "Easy"
-    MEDIUM = "Medium"
-    HARD = "Hard"
-
-
-# Request Models
-class LabStartRequest(BaseModel):
-    missionId: str
-
-
-class FlagVerifyRequest(BaseModel):
-    flag: str
-
-
-# Response Models
-class Domain(BaseModel):
-    id: str
-    name: str
-    icon: str
-    description: str
-    totalMissions: int
-    completedMissions: int = 0
-
-
-class Theory(BaseModel):
-    title: str
-    content: str
-
-
-class Mission(BaseModel):
-    id: str
-    title: str
-    description: str
-    difficulty: str
-    estimatedTime: str
-    points: int
-    bugs: int
-    foundBugs: int = 0
-    status: MissionStatus
-    endpoint: str
-    baseUrl: str
-    theory: Theory
-    hints: List[str] = []
-    domainId: str
-    tier: str
-
-
-class TierInfo(BaseModel):
-    unlocked: bool
-    progress: int = 0
-    requiredProgress: int = 80
-    missions: List[Mission] = []
-
-
-class DomainMissionsResponse(BaseModel):
-    domainId: str
-    tiers: Dict[str, TierInfo]
-
-
-class LabSession(BaseModel):
-    sessionId: str
-    missionId: str
-    baseUrl: str
-    expiresAt: str
-    status: str
-
-
-class FlagVerifyResponse(BaseModel):
-    valid: bool
-    newFlag: bool = False
-    alreadyFound: bool = False
-    points: int = 0
-    bugTitle: Optional[str] = None
-    missionId: Optional[str] = None
-    message: str
+# Импорт роутера миссий (модели теперь в schemas/missions.py)
+from app.api import missions as missions_router
+app.include_router(missions_router.router, prefix="/api/v1", tags=["missions"])
 
 
-class FoundFlag(BaseModel):
-    id: str
-    oderId: str  # userId - typo в спецификации, сохраняем для совместимости
-    missionId: str
-    flag: str
-    bugTitle: str
-    bugDescription: Optional[str] = None
-    points: int
-    difficulty: FlagDifficulty
-    foundAt: str
-
-
-class UserStats(BaseModel):
-    userId: str
-    totalPoints: int
-    rank: str
-    completedMissions: int
-    foundBugs: int
-    totalBugs: int
+# Startup event для логирования и миграций
+@app.on_event("startup")
+async def startup_event():
+    # #region agent log
+    logger.info("Application startup: Starting initialization...")
+    logger.info(f"Database URL configured: {bool(os.getenv('DATABASE_URL'))}")
+    logger.info(f"JWT Secret configured: {bool(os.getenv('JWT_SECRET_KEY'))}")
+    
+    # Проверка версии AuthService
+    try:
+        from app.services.auth_service import AUTH_SERVICE_VERSION
+        logger.info(f"AuthService version: {AUTH_SERVICE_VERSION}")
+    except ImportError:
+        logger.warning("Could not import AUTH_SERVICE_VERSION - using old version")
+    # #endregion
+    
+    # Автоматически применяем миграции при старте
+    if os.getenv("DATABASE_URL"):
+        try:
+            # #region agent log
+            logger.info("Running database migrations...")
+            # #endregion
+            from app.db.migrate import run_migration
+            await run_migration()
+            # #region agent log
+            logger.info("Database migrations completed successfully")
+            # #endregion
+        except Exception as e:
+            # #region agent log
+            logger.exception(f"Error running migrations: {type(e).__name__}: {e}")
+            logger.warning("Continuing startup despite migration error - tables may already exist")
+            # #endregion
+    
+    # #region agent log
+    logger.info("Application startup completed successfully")
+    # #endregion
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -201,8 +245,8 @@ class Database:
                 id="ecommerce",
                 name="E-Commerce",
                 icon="🛒",
-                description="Интернет-магазины, корзины, заказы, возвраты",
-                totalMissions=1,
+                description="Интернет-магазины: Products, Cart, Orders, Checkout (по документу ECOMMERCE_TRAINING_MISSIONS_T1_T5)",
+                totalMissions=10,
                 completedMissions=0
             ),
             "fintech": Domain(
@@ -248,149 +292,245 @@ class Database:
         }
     
     def _init_missions(self):
+        # baseUrl лабы E-Commerce (Products, Cart, Orders, Checkout — см. ECOMMERCE_TRAINING_MISSIONS_T1_T5.md)
+        ecom_lab_url = os.getenv("ECOM_LAB_URL", "https://qa-lab-ecom-return-refund.fly.dev")
         self.missions = {
-            "ecom-return-refund": Mission(
-                id="ecom-return-refund",
-                title="Return & Refund Pipeline",
-                description="Тестирование API возвратов товаров крупного маркетплейса MegaMart. Найдите 12 скрытых багов в сложной бизнес-логике.",
-                difficulty="Advanced",
-                estimatedTime="4-6 часов",
-                points=1750,
-                bugs=12,
+            # === E-Commerce по документу ECOMMERCE_TRAINING_MISSIONS_T1_T5 ===
+            # T1: Mission 1.1 "Призрачный товар" (Ghost Product)
+            "ecom-t1-001": Mission(
+                id="ecom-t1-001",
+                title="Призрачный товар (Ghost Product)",
+                description="Проверка корректных HTTP status codes для отсутствующих ресурсов.",
+                difficulty="Beginner",
+                estimatedTime="15 мин",
+                points=50,
+                bugs=2,
                 foundBugs=0,
                 status=MissionStatus.AVAILABLE,
-                endpoint="/api/v1/returns",
-                baseUrl=os.getenv("ECOM_LAB_URL", "https://qa-lab-ecom-return-refund.fly.dev"),
-                theory=Theory(
-                    title="Тестирование сложных бизнес-процессов",
-                    content="""## Введение
-
-В этой миссии вы будете тестировать систему обработки возвратов товаров маркетплейса MegaMart.
-
-## Ключевые области тестирования
-
-### 1. Бизнес-правила
-- Сроки возврата (14 дней стандарт, 7 дней электроника, 30 дней VIP)
-- Категории товаров (некоторые не подлежат возврату)
-- Расчёт суммы возврата с учётом скидок
-
-### 2. Валидация данных  
-- 127 параметров в запросе на возврат
-- Взаимозависимости между полями
-- Граничные значения
-
-### 3. Безопасность
-- Проверка владельца данных
-- Антифрод система
-- Авторизация операций
-
-### 4. Интеграции
-- Логистика (курьеры, ПВЗ)
-- Платёжные системы
-- Система лояльности
-
-## API Endpoints
-
-- `POST /api/v1/returns` - Создание заявки на возврат
-- `GET /api/v1/returns/{id}` - Получение статуса
-- `POST /api/v1/returns/{id}/cancel` - Отмена заявки
-- `GET /api/v1/hints` - Подсказки
-
-## Формат флагов
-
-При нахождении бага API возвращает флаг:
-```
-FLAG{SNAKE_CASE_NAME}
-```
-
-Введите флаг в поле проверки для получения баллов."""
-                ),
-                hints=[
-                    "Проверьте, когда именно определяется тип клиента — при покупке или при возврате",
-                    "Внимательно посмотрите на все поля, содержащие слово 'Food'",
-                    "Как рассчитывается скидка за bundle при частичном возврате?"
-                ],
+                endpoint="/products/{id}",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t1-001")),
+                hints=["Вспомни, какой статус-код должен возвращаться для несуществующего ресурса", "Подумай о граничных и нестандартных значениях идентификатора (вне ожидаемого диапазона)", "Скрытые баги: система может некорректно обрабатывать граничные случаи для id — найдите флаги и зарегистрируйте на странице Flags."],
                 domainId="ecommerce",
-                tier="T4-T5"
-            )
+                tier="T1",
+                taskDescription="Интернет-магазин электроники запустил новый каталог товаров. Клиенты жалуются, что при попытке открыть несуществующий товар система ведёт себя странно. Проверьте корректность обработки запросов к несуществующим ресурсам.\n\nОжидаемое поведение: несуществующий товар → 404 Not Found. Для id от 1 до 1000 API возвращает соответствующий товар из каталога. Для id вне допустимого диапазона — корректная ошибка без раскрытия внутренних данных.\n\nСкрытые баги: система может некорректно обрабатывать граничные или нестандартные значения id.",
+                requestBodyExample=None  # GET — тело не требуется
+            ),
+            # T1: Mission 1.2 "Метод не тот" (Wrong Method)
+            "ecom-t1-002": Mission(
+                id="ecom-t1-002",
+                title="Метод не тот (Wrong Method)",
+                description="Проверка допустимых HTTP методов для endpoints.",
+                difficulty="Beginner",
+                estimatedTime="15 мин",
+                points=50,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/products/{id}",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t1-002")),
+                hints=["Вспомни, какие HTTP-методы допустимы для read-only ресурсов и как сервер сообщает о недопустимом методе", "Подумай, как API должен реагировать на «не тот» метод к тому же пути", "Скрытый баг: API может принять неожиданный метод и вернуть 200 с флагом — найдите и зарегистрируйте флаг на странице Flags."],
+                domainId="ecommerce",
+                tier="T1",
+                taskDescription="Разработчики утверждают, что API строго следует REST-конвенциям. Проверьте, правильно ли обрабатываются некорректные HTTP-методы.\n\nОжидаемое поведение: POST к read-only endpoint → 405 Method Not Allowed.",
+                requestBodyExample='{"any": "data"}'
+            ),
+            # T1: Mission 1.3 "Пустая корзина" (Empty Cart)
+            "ecom-t1-003": Mission(
+                id="ecom-t1-003",
+                title="Пустая корзина (Empty Cart)",
+                description="Проверка обязательных полей (required fields validation).",
+                difficulty="Beginner",
+                estimatedTime="15 мин",
+                points=50,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/cart/items",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t1-003")),
+                hints=["Вспомни, как проверяются обязательные поля и минимальные значения в API", "Подумай о разнице между отсутствующим полем и нулевым значением", "Скрытый баг: API может принять невалидное или отсутствующее значение и вернуть 201 с флагом — найдите и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T1",
+                taskDescription="Функция добавления товара в корзину должна валидировать все обязательные поля. Проверьте, что система корректно отклоняет запросы с отсутствующими или недопустимыми данными.\n\nОжидаемое поведение: запрос с отсутствующими обязательными полями или недопустимыми значениями → 400 Bad Request.",
+                requestBodyExample='{"productId": "123", "quantity": 1}'
+            ),
+            # T1: Mission 1.4 "Типы данных" (Data Types)
+            "ecom-t1-004": Mission(
+                id="ecom-t1-004",
+                title="Типы данных (Data Types)",
+                description="Type coercion и строгая валидация типов.",
+                difficulty="Beginner",
+                estimatedTime="15 мин",
+                points=50,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/cart/items",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t1-004")),
+                hints=["Вспомни, как контракт API задаёт типы полей (integer, string) и что происходит при несоответствии", "Подумай о неявном преобразовании типов в разных языках и фреймворках", "Скрытый баг: API может принять значение неверного типа и вернуть успешный ответ — найдите и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T1",
+                taskDescription="В endpoint добавления в корзину (POST /cart/items) поле quantity по контракту должно быть целым числом (integer). Партнёры иногда отправляют данные в неверном формате. Ожидается строгая валидация типов.\n\nОжидаемое поведение: запрос с некорректным типом для обязательных полей → 400 Bad Request. Корректный запрос с ожидаемыми типами → 201 Created.",
+                requestBodyExample='{"productId": "123", "quantity": 5}'
+            ),
+            # T1: Mission 1.5 "Content-Type игнорируется" (Content-Type Bypass)
+            "ecom-t1-005": Mission(
+                id="ecom-t1-005",
+                title="Content-Type игнорируется (Content-Type Bypass)",
+                description="Валидация Content-Type заголовка.",
+                difficulty="Beginner",
+                estimatedTime="15 мин",
+                points=50,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/cart/items",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t1-005")),
+                hints=["Вспомни, зачем клиент отправляет заголовок Content-Type и как сервер должен на него реагировать", "Подумай, что происходит, если заголовок не совпадает с форматом тела", "Скрытый баг: API может игнорировать Content-Type и вернуть 200 с флагом — найдите и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T1",
+                taskDescription="REST API должен проверять заголовок Content-Type и отклонять запросы с неподдерживаемыми форматами.\n\nОжидаемое поведение: JSON с Content-Type: text/plain → 415 Unsupported Media Type.",
+                requestBodyExample='{"productId": "123", "quantity": 1}'
+            ),
+            # T1: Mission 1.6 "Дублирование заказа" (Duplicate Order)
+            "ecom-t1-006": Mission(
+                id="ecom-t1-006",
+                title="Дублирование заказа (Duplicate Order)",
+                description="Идемпотентность операций.",
+                difficulty="Beginner",
+                estimatedTime="20 мин",
+                points=50,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/orders",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t1-006")),
+                hints=["Вспомни, зачем нужна идемпотентность при создании заказов и как её обычно реализуют", "Подумай, что должно происходить при повторной отправке того же запроса", "Скрытый баг: API может игнорировать ключ идемпотентности и создавать дубликаты — найдите флаг и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T1",
+                taskDescription="При создании заказа API должен корректно обрабатывать повторную отправку идентичного запроса.\n\nОжидаемое поведение: повторный POST с тем же X-Idempotency-Key → 200 OK с существующим заказом (тот же orderId).",
+                requestBodyExample='{"cartId": "cart-001"}'
+            ),
+            # T2: Mission 2.1 "Граница количества" (Quantity Boundary)
+            "ecom-t2-001": Mission(
+                id="ecom-t2-001",
+                title="Граница количества (Quantity Boundary)",
+                description="Граничные значения: quantity от 1 до 99. Off-by-one в валидации.",
+                difficulty="Intermediate",
+                estimatedTime="20 мин",
+                points=60,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/cart/items",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t2-001")),
+                hints=["Вспомни про тестирование граничных значений: что проверять на границах объявленного диапазона", "Подумай об ошибках off-by-one в условиях валидации", "Скрытый баг: API может принять значение за границей диапазона и вернуть 201 с флагом — найдите и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T2",
+                taskDescription="В корзине действует правило: в одной позиции можно заказать от 1 до 99 единиц товара. Запросы с quantity вне этого диапазона должны отклоняться.\n\nОжидаемое поведение: значения в допустимом диапазоне принимаются (201 Created). Значения вне диапазона → 400 Bad Request.",
+                requestBodyExample='{"productId": "123", "quantity": 5}'
+            ),
+            # T3: Mission 3.1 "Машина состояний заказа" (Order State Machine)
+            "ecom-t3-001": Mission(
+                id="ecom-t3-001",
+                title="Машина состояний заказа (Order State Machine)",
+                description="Заказ в статусе DELIVERED нельзя отменить. Проверка допустимых переходов.",
+                difficulty="Intermediate",
+                estimatedTime="30 мин",
+                points=80,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/orders/{id}/cancel",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t3-001")),
+                hints=["Вспомни про машины состояний: какие переходы допустимы после доставки заказа", "Подумай, как API должен реагировать на попытку изменить состояние уже доставленного заказа", "Скрытый баг: API может разрешить недопустимый переход и вернуть флаг — найдите и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T3",
+                taskDescription="Заказ проходит через состояния: CREATED → PAID → PROCESSING → SHIPPED → DELIVERED. Проверьте корректность переходов между состояниями.\n\nОжидаемое поведение: доставленный заказ (DELIVERED) нельзя отменить.",
+                requestBodyExample=None  # POST без тела или пустое тело
+            ),
+            # T4: Mission 4.1 "Чужой заказ" (IDOR)
+            "ecom-t4-001": Mission(
+                id="ecom-t4-001",
+                title="Чужой заказ (Other's Order — IDOR)",
+                description="Пользователь должен видеть только свои заказы. Проверка изоляции данных.",
+                difficulty="Hard",
+                estimatedTime="35 мин",
+                points=100,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/orders/{id}",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t4-001")),
+                hints=["Вспомни про проверку владельца ресурса: кто должен видеть данные заказа", "Подумай, как API различает «свой» и «чужой» ресурс при доступе по id", "Скрытый баг: API может вернуть данные чужого ресурса — найдите флаг и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T4",
+                taskDescription="Пользователь должен видеть только свои заказы. Проверьте изоляцию данных между пользователями.\n\nОжидаемое поведение: пользователь видит только свои заказы.",
+                requestBodyExample=None  # GET — тело не требуется
+            ),
+            # T5: Mission 5.1 "Промокод-брутфорс" (Promo Bruteforce)
+            "ecom-t5-001": Mission(
+                id="ecom-t5-001",
+                title="Промокод-брутфорс (Promo Bruteforce)",
+                description="Промокоды формата XXXX-XXXX. Проверка защиты от перебора.",
+                difficulty="Expert",
+                estimatedTime="45 мин",
+                points=120,
+                bugs=1,
+                foundBugs=0,
+                status=MissionStatus.AVAILABLE,
+                endpoint="/checkout/promo",
+                baseUrl=ecom_lab_url,
+                theory=Theory(**get_theory("ecom-t5-001")),
+                hints=["Вспомни про защиту от перебора: что должно ограничивать количество попыток проверки кода", "Подумай, как сервер реагирует на массовые запросы к одному endpoint", "Скрытый баг: отсутствие ограничения позволяет перебирать коды — найдите флаг и зарегистрируйте на странице Flags."],
+                domainId="ecommerce",
+                tier="T5",
+                taskDescription="Промокоды имеют формат XXXX-XXXX. Проверьте защиту от перебора.\n\nОжидаемое поведение: защита от brute-force атак на промокоды.",
+                requestBodyExample='{\n  "code": "TEST-0001"\n}'
+            ),
         }
-        
-        # Маппинг флагов миссии (для верификации)
+        # Маппинг флагов (по документу ECOMMERCE_TRAINING_MISSIONS_T1_T5)
+        # ВАЖНО: Все флаги должны быть в ВЕРХНЕМ регистре для соответствия системе валидации
         self.mission_flags = {
-            "ecom-return-refund": {
-                "FLAG{RETURN_WINDOW_BYPASS}": {
-                    "title": "Return Window Bypass",
-                    "description": "VIP статус после покупки даёт расширенный срок",
-                    "points": 150,
-                    "difficulty": FlagDifficulty.HARD
-                },
-                "FLAG{FOOD_CATEGORY_INCONSISTENCY}": {
-                    "title": "Food Category Inconsistency",
-                    "description": "Subcategory с 'Food' проходит проверку",
-                    "points": 100,
-                    "difficulty": FlagDifficulty.MEDIUM
-                },
-                "FLAG{DISCOUNT_DOUBLE_REFUND}": {
-                    "title": "Discount Double Refund",
-                    "description": "Bundle-скидка не пересчитывается при частичном возврате",
-                    "points": 150,
-                    "difficulty": FlagDifficulty.HARD
-                },
-                "FLAG{RESTOCKING_FEE_VIP_CONFLICT}": {
-                    "title": "Restocking Fee VIP Conflict",
-                    "description": "VIP полностью отменяет fee даже для вскрытых товаров",
-                    "points": 150,
-                    "difficulty": FlagDifficulty.HARD
-                },
-                "FLAG{COURIER_WEEKEND_SLIP}": {
-                    "title": "Courier Weekend Slip",
-                    "description": "Праздничные дни не блокируются",
-                    "points": 100,
-                    "difficulty": FlagDifficulty.MEDIUM
-                },
-                "FLAG{CROSSBORDER_COURIER_ALLOWED}": {
-                    "title": "CrossBorder Courier Allowed",
-                    "description": "Курьер доступен для cross-border вопреки правилам",
-                    "points": 150,
-                    "difficulty": FlagDifficulty.HARD
-                },
-                "FLAG{FRAUD_SCORE_BYPASS}": {
-                    "title": "Fraud Score Bypass",
-                    "description": "Отменённые заявки не учитываются в счётчике",
-                    "points": 200,
-                    "difficulty": FlagDifficulty.HARD
-                },
-                "FLAG{IIN_OWNER_MISMATCH}": {
-                    "title": "IIN Owner Mismatch",
-                    "description": "ИИН получателя не сверяется с покупателем",
-                    "points": 200,
-                    "difficulty": FlagDifficulty.HARD
-                },
-                "FLAG{INSPECTION_SKIP_THRESHOLD}": {
-                    "title": "Inspection Skip Threshold",
-                    "description": "Порог 100K проверяется per item, не по сумме",
-                    "points": 150,
-                    "difficulty": FlagDifficulty.HARD
-                },
-                "FLAG{EXCHANGE_DIFFERENT_CATEGORY}": {
-                    "title": "Exchange Different Category",
-                    "description": "Обмен между разными категориями проходит",
-                    "points": 100,
-                    "difficulty": FlagDifficulty.MEDIUM
-                },
-                "FLAG{VIDEO_REQUIREMENT_BYPASS}": {
-                    "title": "Video Requirement Bypass",
-                    "description": "Невалидные URL видео принимаются",
-                    "points": 100,
-                    "difficulty": FlagDifficulty.MEDIUM
-                },
-                "FLAG{LOYALTY_POINTS_OVERFLOW}": {
-                    "title": "Loyalty Points Overflow",
-                    "description": "Integer overflow при возврате бонусов",
-                    "points": 200,
-                    "difficulty": FlagDifficulty.HARD
-                },
-            }
+            "ecom-t1-001": {
+                "FLAG{IDOR_NEGATIVE_ID_A1B2C3}": {"title": "IDOR Negative ID", "description": "Отрицательный ID возвращает внутренние данные", "points": 50, "difficulty": FlagDifficulty.EASY},
+                "FLAG{INTEGER_OVERFLOW_D4E5F6}": {"title": "Integer Overflow", "description": "ID > MAX_INT вызывает переполнение", "points": 50, "difficulty": FlagDifficulty.EASY},
+            },
+            "ecom-t1-002": {
+                "FLAG{METHOD_CONFUSION_ALLOWED}": {"title": "Wrong Method Allowed", "description": "POST к read-only endpoint возвращает 200", "points": 50, "difficulty": FlagDifficulty.EASY},
+            },
+            "ecom-t1-003": {
+                "FLAG{QUANTITY_ZERO_ACCEPTED}": {"title": "Quantity Zero Accepted", "description": "quantity=0 или отсутствует принимается", "points": 50, "difficulty": FlagDifficulty.EASY},
+            },
+            "ecom-t1-004": {
+                "FLAG{STRING_QUANTITY_PARSED}": {"title": "String Quantity Parsed", "description": "Строка типа \"5шт\" парсится как число", "points": 50, "difficulty": FlagDifficulty.EASY},
+            },
+            "ecom-t1-005": {
+                "FLAG{CONTENT_TYPE_BYPASS}": {"title": "Content-Type Bypass", "description": "JSON с Content-Type: text/plain принимается", "points": 50, "difficulty": FlagDifficulty.EASY},
+            },
+            "ecom-t1-006": {
+                "FLAG{IDEMPOTENCY_IGNORED}": {"title": "Idempotency Ignored", "description": "Повторный POST с тем же ключом создаёт новый заказ", "points": 50, "difficulty": FlagDifficulty.EASY},
+            },
+            "ecom-t2-001": {
+                "FLAG{BOUNDARY_OFF_BY_ONE}": {"title": "Boundary Off By One", "description": "quantity=100 проходит", "points": 60, "difficulty": FlagDifficulty.MEDIUM},
+            },
+            "ecom-t3-001": {
+                "FLAG{DELIVERED_ORDER_CANCELLED}": {"title": "Delivered Order Cancelled", "description": "Отмена доставленного заказа", "points": 80, "difficulty": FlagDifficulty.MEDIUM},
+            },
+            "ecom-t4-001": {
+                "FLAG{ORDER_IDOR_EXPOSED}": {"title": "Order IDOR Exposed", "description": "Доступ к чужому заказу", "points": 100, "difficulty": FlagDifficulty.HARD},
+            },
+            "ecom-t5-001": {
+                "FLAG{PROMO_BRUTEFORCE_ALLOWED}": {"title": "Promo Bruteforce Allowed", "description": "Нет rate limit на промокоды", "points": 120, "difficulty": FlagDifficulty.HARD},
+            },
         }
     
     def get_user_id(self) -> str:
@@ -422,67 +562,12 @@ async def health_check():
     return {"status": "healthy", "service": "qa-platform-backend", "timestamp": datetime.now().isoformat()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DOMAINS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/v1/domains")
-async def get_domains():
-    """Получение списка доменов"""
-    return {"domains": list(db.domains.values())}
-
-
-@app.get("/api/v1/domains/{domain_id}")
-async def get_domain(domain_id: str):
-    """Получение домена по ID"""
-    if domain_id not in db.domains:
-        raise HTTPException(status_code=404, detail="Domain not found")
-    return db.domains[domain_id]
-
-
-@app.get("/api/v1/domains/{domain_id}/missions")
-async def get_domain_missions(domain_id: str):
-    """Получение миссий домена с группировкой по тирам"""
-    if domain_id not in db.domains:
-        raise HTTPException(status_code=404, detail="Domain not found")
-    
-    # Получаем миссии домена
-    domain_missions = [m for m in db.missions.values() if m.domainId == domain_id]
-    
-    # Группируем по тирам
-    tiers = {
-        "T1": TierInfo(unlocked=True, progress=0, missions=[]),
-        "T2": TierInfo(unlocked=True, progress=0, missions=[]),
-        "T3": TierInfo(unlocked=True, progress=0, missions=[]),
-        "T4": TierInfo(unlocked=True, progress=0, missions=[]),
-        "T5": TierInfo(unlocked=True, progress=0, missions=[]),
-    }
-    
-    for mission in domain_missions:
-        # Определяем тир из mission.tier (может быть "T4-T5")
-        tier_key = mission.tier.split("-")[0] if "-" in mission.tier else mission.tier
-        if tier_key in tiers:
-            tiers[tier_key].missions.append(mission)
-    
-    return DomainMissionsResponse(domainId=domain_id, tiers=tiers)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MISSIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/v1/missions")
-async def get_all_missions():
-    """Получение всех миссий"""
-    return {"missions": list(db.missions.values())}
-
-
-@app.get("/api/v1/missions/{mission_id}")
-async def get_mission(mission_id: str):
-    """Получение детальной информации о миссии"""
-    if mission_id not in db.missions:
-        raise HTTPException(status_code=404, detail="Mission not found")
-    return db.missions[mission_id]
+# Endpoints для доменов и миссий теперь в роутерах:
+# - /api/v1/domains -> missions_router
+# - /api/v1/domains/{domain_id} -> missions_router
+# - /api/v1/domains/{domain_id}/missions -> missions_router
+# - /api/v1/missions -> missions_router
+# - /api/v1/missions/{mission_id} -> missions_router
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -490,21 +575,72 @@ async def get_mission(mission_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/labs/start")
-async def start_lab(request: LabStartRequest):
+async def start_lab(
+    request: LabStartRequest,
+    current_user: User = Depends(get_current_user),
+    db_session: AsyncSession = Depends(get_db)
+):
     """
     Запуск лабораторной среды
     
     В MVP версии возвращаем URL уже задеплоенной лабы.
     В production здесь будет оркестрация контейнеров через Fly.io Machines API.
     """
-    if request.missionId not in db.missions:
+    # Получить миссию из БД
+    from app.models.mission import Mission as MissionDB, Bug, UserFoundFlag
+    from sqlalchemy import select
+    from sqlalchemy import func
+    
+    result = await db_session.execute(select(MissionDB).where(MissionDB.id == request.missionId))
+    mission_db = result.scalar_one_or_none()
+    
+    if not mission_db:
         raise HTTPException(status_code=404, detail="Mission not found")
     
-    mission = db.missions[request.missionId]
+    # Проверить, разблокирован ли тир для пользователя
+    tier = mission_db.tier
+    domain_id = mission_db.domain_id
+    
+    # T1 всегда разблокирован
+    if tier != "T1":
+        tier_num = int(tier[1])
+        if tier_num >= 2:
+            prev_tier = f"T{tier_num - 1}"
+            
+            # Получить все активные баги предыдущего тира в этом домене (Phase2: active only)
+            bugs_query = (
+                select(Bug.id, Bug.mission_id)
+                .join(MissionDB, Bug.mission_id == MissionDB.id)
+                .where(MissionDB.domain_id == domain_id)
+                .where(MissionDB.tier == prev_tier)
+            )
+            if hasattr(Bug, 'active'):
+                bugs_query = bugs_query.where(Bug.active == True)
+            bugs_result = await db_session.execute(bugs_query)
+            prev_tier_bugs = bugs_result.all()
+            total_bugs = len(prev_tier_bugs)
+            
+            if total_bugs > 0:
+                bug_ids = [bug.id for bug in prev_tier_bugs]
+                found_flags_result = await db_session.execute(
+                    select(func.count(UserFoundFlag.id))
+                    .where(UserFoundFlag.user_id == current_user.id)
+                    .where(UserFoundFlag.bug_id.in_(bug_ids))
+                )
+                found_bugs = found_flags_result.scalar() or 0
+                
+                progress = round((found_bugs / total_bugs) * 100)
+                if progress < 80:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Tier {tier} is locked. Complete 80% of {prev_tier} missions first."
+                    )
+    
+    mission_base_url = mission_db.base_url
     session_id = str(uuid.uuid4())[:12]
     
     # Проверяем доступность лабы
-    lab_url = mission.baseUrl
+    lab_url = mission_base_url
     lab_status = "pending"
     
     try:
@@ -544,153 +680,10 @@ async def stop_lab(session_id: str):
     return {"message": "Lab session stopped", "sessionId": session_id}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FLAGS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/v1/flags/verify")
-async def verify_flag(request: FlagVerifyRequest):
-    """
-    Верификация флага
-    
-    1. Проверяем формат флага
-    2. Ищем в нашей базе флагов
-    3. Опционально валидируем через API лабы
-    """
-    flag = request.flag.strip().upper()
-    user_id = db.get_user_id()
-    
-    # Инициализируем список флагов пользователя
-    if user_id not in db.found_flags:
-        db.found_flags[user_id] = []
-    
-    # Проверяем, не найден ли уже этот флаг
-    existing_flags = [f.flag for f in db.found_flags[user_id]]
-    if flag in existing_flags:
-        return FlagVerifyResponse(
-            valid=True,
-            alreadyFound=True,
-            points=0,
-            message="Флаг уже был зарегистрирован ранее"
-        )
-    
-    # Ищем флаг в нашей базе
-    for mission_id, flags in db.mission_flags.items():
-        if flag in flags:
-            flag_info = flags[flag]
-            
-            # Создаём запись о найденном флаге
-            found_flag = FoundFlag(
-                id=str(uuid.uuid4()),
-                oderId=user_id,
-                missionId=mission_id,
-                flag=flag,
-                bugTitle=flag_info["title"],
-                bugDescription=flag_info["description"],
-                points=flag_info["points"],
-                difficulty=flag_info["difficulty"],
-                foundAt=datetime.now().isoformat()
-            )
-            
-            db.found_flags[user_id].append(found_flag)
-            
-            return FlagVerifyResponse(
-                valid=True,
-                newFlag=True,
-                points=flag_info["points"],
-                bugTitle=flag_info["title"],
-                missionId=mission_id,
-                message=f"🎉 Отлично! Флаг принят! +{flag_info['points']} баллов"
-            )
-    
-    # Пробуем валидировать через API лабы (если лаба запущена)
-    for mission_id, mission in db.missions.items():
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.post(
-                    f"{mission.baseUrl}/api/v1/flags/verify",
-                    json={"flag": flag},
-                    headers={"X-Platform-Secret": settings.PLATFORM_SECRET}
-                )
-                if response.status_code == 200:
-                    result = response.json()
-                    if result.get("valid"):
-                        info = result.get("info", {})
-                        points = info.get("points", 100)
-                        title = info.get("name", "Unknown Bug")
-                        
-                        found_flag = FoundFlag(
-                            id=str(uuid.uuid4()),
-                            oderId=user_id,
-                            missionId=mission_id,
-                            flag=flag,
-                            bugTitle=title,
-                            bugDescription=info.get("description"),
-                            points=points,
-                            difficulty=FlagDifficulty.MEDIUM,
-                            foundAt=datetime.now().isoformat()
-                        )
-                        
-                        db.found_flags[user_id].append(found_flag)
-                        
-                        return FlagVerifyResponse(
-                            valid=True,
-                            newFlag=True,
-                            points=points,
-                            bugTitle=title,
-                            missionId=mission_id,
-                            message=f"🎉 Отлично! Флаг принят! +{points} баллов"
-                        )
-        except:
-            continue
-    
-    return FlagVerifyResponse(
-        valid=False,
-        points=0,
-        message="Флаг не найден в системе"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# USER STATS & FLAGS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/v1/users/me/stats")
-async def get_user_stats():
-    """Получение статистики пользователя"""
-    user_id = db.get_user_id()
-    user_flags = db.found_flags.get(user_id, [])
-    
-    total_points = sum(f.points for f in user_flags)
-    total_bugs = sum(m.bugs for m in db.missions.values())
-    
-    # Подсчёт завершённых миссий
-    completed_missions = 0
-    for mission in db.missions.values():
-        mission_flags = [f for f in user_flags if f.missionId == mission.id]
-        if len(mission_flags) >= mission.bugs:
-            completed_missions += 1
-    
-    return UserStats(
-        userId=user_id,
-        totalPoints=total_points,
-        rank=db.get_rank(total_points),
-        completedMissions=completed_missions,
-        foundBugs=len(user_flags),
-        totalBugs=total_bugs
-    )
-
-
-@app.get("/api/v1/users/me/flags")
-async def get_user_flags():
-    """Получение найденных флагов пользователя"""
-    user_id = db.get_user_id()
-    user_flags = db.found_flags.get(user_id, [])
-    
-    return {
-        "flags": [f.dict() for f in user_flags],
-        "total": len(user_flags)
-    }
+# Endpoints для флагов и пользователей теперь в роутерах:
+# - /api/v1/flags/verify -> flags.router
+# - /api/v1/users/me/stats -> users.router
+# - /api/v1/users/me/flags -> users.router
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -698,6 +691,9 @@ async def get_user_flags():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # #region agent log
+    logger.info(f"App starting: port={int(os.getenv('PORT', 8080))}, debug={settings.DEBUG}, frontendUrl={app_settings.FRONTEND_URL}, hasDatabaseUrl={bool(os.getenv('DATABASE_URL'))}")
+    # #endregion
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

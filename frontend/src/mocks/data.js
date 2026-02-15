@@ -76,6 +76,32 @@ export const domains = [
   },
 ];
 
+// Landing page: 6 techniques (for main page intro block)
+export const landingTechniques = [
+  { id: 'boundary', title: 'Boundary Testing', description: 'Проверка граничных значений: min/max, overflow, пустые и невалидные данные.' },
+  { id: 'idor', title: 'IDOR Hunting', description: 'Поиск небезопасных прямых ссылок на объекты: доступ к чужим ресурсам по ID.' },
+  { id: 'fuzzing', title: 'Input Fuzzing', description: 'Массовая подстановка нестандартных входных данных для выявления сбоев и утечек.' },
+  { id: 'state', title: 'State Manipulation', description: 'Нарушение ожидаемого порядка состояний: переходы в обход бизнес-правил.' },
+  { id: 'race', title: 'Race Conditions', description: 'Параллельные запросы для проверки гонок и неконсистентного состояния.' },
+  { id: 'auth', title: 'Auth Bypass', description: 'Обход аутентификации и авторизации: токены, заголовки, роли.' },
+];
+
+// Landing page: T1–T5 tiers (focus + unlock condition)
+export const landingTiers = [
+  { tier: 'T1', focus: 'HTTP контракты, базовая валидация', unlock: 'Доступен сразу' },
+  { tier: 'T2', focus: 'Граничные значения, форматы данных', unlock: '80% багов в T1' },
+  { tier: 'T3', focus: 'Бизнес-логика, состояния', unlock: '80% багов в T2' },
+  { tier: 'T4', focus: 'Авторизация, async-операции', unlock: '80% багов в T3' },
+  { tier: 'T5', focus: 'Security, race conditions', unlock: '80% багов в T4' },
+];
+
+// Landing page: illustrative flag examples only (not from missions)
+export const landingFlagExamples = [
+  'QA_FLAG{demo_format_abc}',
+  'QA_FLAG{example_xyz}',
+  'QA_FLAG{sample_illustration}',
+];
+
 export const missionsByDomain = {
   fintech: {
     T1: [
@@ -361,17 +387,16 @@ export const missionsByDomain = {
         baseUrl: 'https://qa-lab-book-t1-rooms.fly.dev',
         theory: {
           title: 'Тестирование дат',
-          content: `Системы бронирования сильно зависят от корректной работы с датами.
+          content: `Системы бронирования сильно зависят от корректной работы с датами и бизнес-правилами доступности.
 
-Проверьте:
-• Бронирование в прошлом
-• Дата выезда раньше даты заезда
-• Пересекающиеся бронирования
-• Граничные даты (31 декабря, 29 февраля)`,
+Направления для исследования:
+• Валидация периода (формат, порядок дат, длительность)
+• Граничные и редкие календарные случаи (конец месяца, високосные годы)
+• Согласованность правил доступности при разных комбинациях параметров`,
         },
         hints: [
-          'Проверьте логику дат заезда/выезда',
-          'Что с прошлыми датами?',
+          'Подумайте о порядке дат и минимальной длительности периода',
+          'Какие граничные календарные случаи стоит учитывать?',
         ],
       },
     ],
@@ -393,14 +418,14 @@ export const missionsByDomain = {
           title: 'Параллельные бронирования',
           content: `Овербукинг — классическая проблема систем бронирования.
 
-Сценарии для тестирования:
-• Два пользователя бронируют последний номер одновременно
-• Отмена и новое бронирование в один момент
-• Изменение дат существующего бронирования`,
+Направления для исследования:
+• Конкурентные сценарии и согласованность данных
+• Повторные запросы и идемпотентность операций
+• Конфликты при изменении/отмене и повторном создании`,
         },
         hints: [
-          'Отправьте несколько бронирований одновременно',
-          'Проверьте блокировки',
+          'Что произойдёт, если действия выполняются почти одновременно?',
+          'Есть ли защита от повторной отправки одного и того же запроса?',
         ],
       },
     ],
@@ -504,34 +529,77 @@ export const missionsByDomain = {
   },
 };
 
-// Helper to calculate tier unlock status
-export function getTierProgress(domainId, tier) {
-  const domain = missionsByDomain[domainId];
+// Helper to calculate tier unlock status (optional 3rd arg: missionsByDomain override for API data)
+export function getTierProgress(domainId, tier, missionsByDomainOverride) {
+  const source = missionsByDomainOverride ?? missionsByDomain;
+  const domain = source[domainId];
   if (!domain) return { unlocked: false, progress: 0 };
   
-  const tierMissions = domain[tier] || [];
+  const tierData = domain[tier];
+  
+  // Если данные из API (с полями unlocked и progress)
+  if (tierData && typeof tierData === 'object' && 'unlocked' in tierData && 'progress' in tierData) {
+    const tierMissions = tierData.missions || [];
+    const totalBugs = tierMissions.reduce((sum, m) => sum + (m.bugs || 0), 0);
+    const foundBugs = tierMissions.reduce((sum, m) => sum + (m.foundBugs ?? 0), 0);
+    return {
+      unlocked: tierData.unlocked,
+      progress: tierData.progress,
+      totalBugs,
+      foundBugs,
+    };
+  }
+  
+  // Старый формат (моки) - массив миссий напрямую
+  const tierMissions = Array.isArray(tierData) ? tierData : (tierData?.missions || []);
   if (tierMissions.length === 0) return { unlocked: false, progress: 0, empty: true };
   
-  const totalBugs = tierMissions.reduce((sum, m) => sum + m.bugs, 0);
-  const foundBugs = tierMissions.reduce((sum, m) => sum + m.foundBugs, 0);
+  const totalBugs = tierMissions.reduce((sum, m) => sum + (m.bugs || 0), 0);
+  const foundBugs = tierMissions.reduce((sum, m) => sum + (m.foundBugs ?? 0), 0);
   const progress = totalBugs > 0 ? Math.round((foundBugs / totalBugs) * 100) : 0;
   
   return { unlocked: true, progress, totalBugs, foundBugs };
 }
 
-export function isTierUnlocked(domainId, tier) {
+export function isTierUnlocked(domainId, tier, missionsByDomainOverride) {
+  // T1 всегда разблокирован для всех студентов
   if (tier === 'T1') return true;
   
+  const source = missionsByDomainOverride ?? missionsByDomain;
+  const domain = source[domainId];
+  if (!domain) return false;
+  
+  const tierData = domain[tier];
+  
+  // Если данные из API (с полем unlocked)
+  if (tierData && typeof tierData === 'object' && 'unlocked' in tierData) {
+    return tierData.unlocked;
+  }
+  
+  // Старый формат (моки) - вычисляем на основе предыдущего тира
   const prevTier = `T${parseInt(tier.slice(1)) - 1}`;
-  const prevProgress = getTierProgress(domainId, prevTier);
+  const prevProgress = getTierProgress(domainId, prevTier, missionsByDomainOverride);
   
   return prevProgress.progress >= 80;
 }
 
 // User stats
 export const mockUserStats = {
-  totalPoints: 370,
-  rank: 'Junior Tester',
+  totalPoints: 270,
+  rank: {
+    id: 'tester',
+    nameRu: 'Тестировщик',
+    nameEn: 'Tester',
+    color: '#3B82F6'
+  },
+  nextRank: {
+    id: 'bug_hunter',
+    nameRu: 'Охотник за багами',
+    nameEn: 'Bug Hunter',
+    minPoints: 350
+  },
+  rankProgress: 44,
+  pointsToNextRank: 80,
   completedMissions: 1,
   foundBugs: 6,
   totalBugs: 45,
